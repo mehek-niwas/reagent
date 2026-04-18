@@ -384,6 +384,8 @@ class ModelBackend:
         if hasattr(prompt_ids, "input_ids"):
             prompt_ids = prompt_ids.input_ids
         prompt_len = prompt_ids.shape[1]
+
+        out_ids = self.model.generate(
             input_ids=prompt_ids,
             max_new_tokens=max_new_tokens,
             do_sample=False,
