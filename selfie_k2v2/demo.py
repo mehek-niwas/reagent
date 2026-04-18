@@ -18,16 +18,13 @@ import os
 import sys
 import time
 
-# Make sure we can import the local modules regardless of where python is run from,
-# as long as this script sits next to them.
-_HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, _HERE)
-
 import torch
 import pandas as pd
 
-from k2v2_backend import K2V2Backend
-from agents_graph import make_graph
+from selfie_k2v2.k2v2_backend import K2V2Backend
+from selfie_k2v2.agents_graph import make_graph
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 # ---- pretty-print helpers ----

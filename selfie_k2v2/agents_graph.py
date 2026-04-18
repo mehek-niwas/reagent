@@ -13,7 +13,7 @@ import torch
 import pandas as pd
 from langgraph.graph import StateGraph, END
 
-from k2v2_backend import K2V2Backend, GenerationResult
+from .k2v2_backend import K2V2Backend, GenerationResult
 
 
 WRITER_SYSTEM = (

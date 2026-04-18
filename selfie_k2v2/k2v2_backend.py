@@ -13,7 +13,7 @@ from typing import List, Optional, Tuple
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from selfie_fork.interpret import (
+from .selfie_fork.interpret import (
     InterpretationPrompt,
     interpret,
     capture_hidden_states,
