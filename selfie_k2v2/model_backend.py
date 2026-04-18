@@ -354,6 +354,30 @@ class ModelBackend:
     # Generation
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _assemble_hidden_states(
+        gen_hs: Tuple,
+    ) -> Tuple[torch.Tensor, ...]:
+        """
+        Reassemble hidden states from model.generate(output_hidden_states=True)
+        into the same shape as model(output_hidden_states=True).hidden_states:
+        a tuple of (num_layers+1,) tensors, each (batch, full_seq_len, hidden_size).
+
+        With KV-cache (the generate() default):
+          gen_hs[step][layer] has shape (batch, step_len, hidden_size)
+          step 0  → step_len = prompt_len   (all prompt tokens, prefill)
+          step k  → step_len = 1            (one new token per decode step)
+        Concatenating across steps gives (batch, prompt_len + T, hidden_size).
+        """
+        if not gen_hs:
+            return ()
+        num_layers = len(gen_hs[0])
+        assembled: List[torch.Tensor] = []
+        for layer_idx in range(num_layers):
+            parts = [gen_hs[step][layer_idx] for step in range(len(gen_hs))]
+            assembled.append(torch.cat(parts, dim=1).detach())
+        return tuple(assembled)
+
     @torch.no_grad()
     def generate(
         self,
@@ -385,24 +409,36 @@ class ModelBackend:
             prompt_ids = prompt_ids.input_ids
         prompt_len = prompt_ids.shape[1]
 
-        out_ids = self.model.generate(
+        gen_kwargs: dict = dict(
             input_ids=prompt_ids,
             max_new_tokens=max_new_tokens,
             do_sample=False,
             pad_token_id=self.tokenizer.eos_token_id,
         )
 
+        if capture_hidden:
+            # Capture hidden states inline during the generation forward passes.
+            # This avoids the expensive second model() call that would re-run the
+            # entire output sequence through the model just to get hidden states.
+            #
+            # With KV-cache (default), generate() returns:
+            #   hidden_states[step][layer] = (batch, step_len, hidden_size)
+            #   step 0  → step_len = prompt_len  (prefill of the full prompt)
+            #   step k  → step_len = 1           (one new token per decode step)
+            # We reassemble them into one tensor per layer over the full sequence.
+            gen_kwargs.update(
+                return_dict_in_generate=True,
+                output_hidden_states=True,
+            )
+            raw = self.model.generate(**gen_kwargs)
+            out_ids = raw.sequences
+            hidden_states = self._assemble_hidden_states(raw.hidden_states)
+        else:
+            out_ids = self.model.generate(**gen_kwargs)
+            hidden_states = None
+
         all_gen_ids = out_ids[0, prompt_len:].tolist()
         answer_ids, answer_offset, output_text, thinking_text = self._post_process(all_gen_ids)
-
-        hidden_states = None
-        if capture_hidden:
-            out = self.model(
-                input_ids=out_ids,
-                output_hidden_states=True,
-                use_cache=False,
-            )
-            hidden_states = tuple(h.detach() for h in out.hidden_states)
 
         return GenerationResult(
             prompt_ids=prompt_ids,
