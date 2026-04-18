@@ -88,11 +88,20 @@ _EDITOR_USER_INJECT = (
 # + continuation primer) which is proven to work for hidden-state probing.
 # XML-style tags like <MSG>...</MSG> were tried first but caused the model to
 # fixate on the framing tokens and emit "<MSG><MSG><MSG>..." loops.
-_WRITER_SELFPROBE_SYSTEM = "You are a helpful assistant."
-_WRITER_SELFPROBE_USER = (
+#
+# These defaults can be overridden by passing writer_selfprobe_system /
+# writer_selfprobe_user through make_probe_nodes / add_probe_to_graph /
+# make_graph.  The user-supplied prompt MUST contain exactly one instance of
+# `_INJECT_MARKER` (default: "<<<INJECT_HERE>>>") — that location is where the
+# writer's hidden states get spliced into the residual stream.
+DEFAULT_WRITER_SELFPROBE_SYSTEM = "You are a helpful assistant."
+DEFAULT_WRITER_SELFPROBE_USER = (
     f"The following is a message: '{_INJECT_MARKER}'.\n"
     "Repeated word-for-word, the message says:"
 )
+# Backwards-compat aliases (internal use only)
+_WRITER_SELFPROBE_SYSTEM = DEFAULT_WRITER_SELFPROBE_SYSTEM
+_WRITER_SELFPROBE_USER = DEFAULT_WRITER_SELFPROBE_USER
 
 
 # ---------------------------------------------------------------------------
@@ -283,6 +292,8 @@ def make_probe_nodes(
     inject_layer: int = 0,
     run_selfie: bool = True,
     selfie_max_positions: int = 8,
+    writer_selfprobe_system: Optional[str] = None,
+    writer_selfprobe_user: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Build all probe node functions and return them as a dict.
@@ -313,8 +324,31 @@ def make_probe_nodes(
         Layer at which to inject hidden states.  0 = embedding layer output
         (most analogous to replacing the token embeddings entirely).
         Set to a mid-layer index to inject deeper representations.
+    writer_selfprobe_system, writer_selfprobe_user : Optional[str]
+        Override the default writer self-probe system/user prompts.  The user
+        string MUST contain exactly one occurrence of the placeholder marker
+        (default "<<<INJECT_HERE>>>" — see _INJECT_MARKER); that location is
+        where the writer's final hidden states get spliced in.  Pass None to
+        use DEFAULT_WRITER_SELFPROBE_SYSTEM / DEFAULT_WRITER_SELFPROBE_USER.
     """
     projector = HiddenStateProjector.between(writer_backend, editor_backend)
+
+    selfprobe_system = (
+        writer_selfprobe_system
+        if writer_selfprobe_system is not None
+        else DEFAULT_WRITER_SELFPROBE_SYSTEM
+    )
+    selfprobe_user = (
+        writer_selfprobe_user
+        if writer_selfprobe_user is not None
+        else DEFAULT_WRITER_SELFPROBE_USER
+    )
+    if _INJECT_MARKER not in selfprobe_user:
+        raise ValueError(
+            f"writer_selfprobe_user must contain the marker {_INJECT_MARKER!r} "
+            "exactly once — that location is where the writer's hidden states "
+            "are spliced into the prompt."
+        )
 
     # ── Arm A: editor with raw text ──────────────────────────────────────────
 
@@ -452,8 +486,8 @@ def make_probe_nodes(
             writer_backend,
             _INJECT_MARKER,
             num_ph,
-            system=_WRITER_SELFPROBE_SYSTEM,
-            user_template=_WRITER_SELFPROBE_USER,
+            system=selfprobe_system,
+            user_template=selfprobe_user,
         )
 
         output = writer_backend.generate_with_injected_embeds(
@@ -542,6 +576,8 @@ def add_probe_to_graph(
     inject_layer: int = 0,
     run_selfie: bool = True,
     selfie_max_positions: int = 8,
+    writer_selfprobe_system: Optional[str] = None,
+    writer_selfprobe_user: Optional[str] = None,
 ) -> StateGraph:
     """
     Attach all probe nodes to `graph` as a linear chain starting from
@@ -574,6 +610,8 @@ def add_probe_to_graph(
         inject_layer=inject_layer,
         run_selfie=run_selfie,
         selfie_max_positions=selfie_max_positions,
+        writer_selfprobe_system=writer_selfprobe_system,
+        writer_selfprobe_user=writer_selfprobe_user,
     )
 
     order = [
@@ -605,6 +643,8 @@ def make_graph(
     inject_layer: int = 0,
     run_selfie: bool = False,
     selfie_max_positions: int = 8,
+    writer_selfprobe_system: Optional[str] = None,
+    writer_selfprobe_user: Optional[str] = None,
 ):
     """
     Build and compile a complete standalone graph:
@@ -659,6 +699,8 @@ def make_graph(
         inject_layer=inject_layer,
         run_selfie=run_selfie,
         selfie_max_positions=selfie_max_positions,
+        writer_selfprobe_system=writer_selfprobe_system,
+        writer_selfprobe_user=writer_selfprobe_user,
     )
 
     return g.compile()

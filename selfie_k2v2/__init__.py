@@ -6,6 +6,8 @@ from .agents_graph import (
     add_probe_to_graph,
     AgentState,
     SelfieProbeMixin,
+    DEFAULT_WRITER_SELFPROBE_SYSTEM,
+    DEFAULT_WRITER_SELFPROBE_USER,
 )
 from .selfie_fork import InterpretationPrompt, interpret, capture_hidden_states
 
@@ -21,6 +23,8 @@ __all__ = [
     "add_probe_to_graph",
     "AgentState",
     "SelfieProbeMixin",
+    "DEFAULT_WRITER_SELFPROBE_SYSTEM",
+    "DEFAULT_WRITER_SELFPROBE_USER",
     # selfie primitives
     "InterpretationPrompt",
     "interpret",

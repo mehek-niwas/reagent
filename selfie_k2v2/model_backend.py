@@ -384,6 +384,7 @@ class ModelBackend:
         prompt_ids: torch.Tensor,
         max_new_tokens: int = 64,
         capture_hidden: bool = True,
+        capture_all_tokens: bool = True,
     ) -> GenerationResult:
         """
         Greedy generation.
@@ -402,6 +403,17 @@ class ModelBackend:
         including any thinking tokens).  Use answer_offset to locate the answer
         span:  answer_positions = range(prompt_len + answer_offset,
                                         prompt_len + answer_offset + len(gen_token_ids))
+
+        capture_all_tokens : bool (default True)
+            Inline HS capture during generate() naturally misses the VERY LAST
+            generated token (the decode loop emits it and exits before running
+            another forward pass on it).  Usually that token is <eos>, but when
+            max_new_tokens is reached mid-answer it can be a content token
+            (e.g. "fetch" at the end of "loves to play fetch").  When True we
+            run ONE additional forward pass on the full output sequence to
+            compute the missing HS for the final position, so the returned
+            hidden_states tensor has the same length as output_ids.
+            Cost: ~1 prefill pass (fast on modern GPUs).
         """
         prompt_ids = prompt_ids.to(self.device)
         # Unwrap BatchEncoding in case caller passed apply_chat_template output directly
@@ -433,6 +445,26 @@ class ModelBackend:
             raw = self.model.generate(**gen_kwargs)
             out_ids = raw.sequences
             hidden_states = self._assemble_hidden_states(raw.hidden_states)
+
+            # Inline capture misses the last generated token's HS.  When that
+            # token carries real content (max_new_tokens reached before EOS),
+            # skipping it loses information.  One extra forward pass fixes it.
+            hs_len = hidden_states[-1].shape[1] if hidden_states else 0
+            full_len = out_ids.shape[1]
+            if capture_all_tokens and hs_len < full_len:
+                attn = torch.ones_like(out_ids)
+                extra = self.model(
+                    input_ids=out_ids,
+                    attention_mask=attn,
+                    output_hidden_states=True,
+                )
+                hidden_states = tuple(
+                    torch.cat(
+                        [hs, extra.hidden_states[layer_idx][:, hs_len:full_len, :].detach()],
+                        dim=1,
+                    )
+                    for layer_idx, hs in enumerate(hidden_states)
+                )
         else:
             out_ids = self.model.generate(**gen_kwargs)
             hidden_states = None
