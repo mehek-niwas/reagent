@@ -197,8 +197,30 @@ def _split_prompt_at_marker(
 
     # Tokenize each half as a plain string; the special tokens are already
     # embedded as text by apply_chat_template, so add_special_tokens=False.
-    pre_ids: List[int] = tok(pre_text, add_special_tokens=False)["input_ids"]
-    post_ids: List[int] = tok(post_text, add_special_tokens=False)["input_ids"]
+    # Multimodal processors can return nested lists or tensors — normalize.
+    def _tokenize_flat(text: str) -> List[int]:
+        out = tok(text, add_special_tokens=False)
+        ids = out["input_ids"]
+        # Handle: tensor → list, nested list [[...]] → [...], list → list
+        if hasattr(ids, "tolist"):
+            ids = ids.tolist()
+        if ids and isinstance(ids[0], list):
+            ids = ids[0]
+        return [int(x) for x in ids]
+
+    pre_ids = _tokenize_flat(pre_text)
+    post_ids = _tokenize_flat(post_text)
+
+    # CPU-side vocab range check — catches out-of-range IDs before they hit
+    # the GPU embedding lookup (which would produce an opaque async CUDA assert).
+    vocab_size = backend.model.get_input_embeddings().num_embeddings
+    for label, ids in (("pre", pre_ids), ("post", post_ids)):
+        for tid in ids:
+            if tid < 0 or tid >= vocab_size:
+                raise RuntimeError(
+                    f"Token id {tid} out of range [0, {vocab_size}) in {label}_ids. "
+                    f"Tokenizer/embedding mismatch for {type(tok).__name__}."
+                )
     return pre_ids, post_ids
 
 
@@ -289,6 +311,26 @@ def make_probe_nodes(
         )
 
         writer_toks = state["writer_output_token_ids"]
+
+        # If writer and editor have different tokenizers, the writer's token IDs
+        # may be out of range for the editor's embedding table.  Detect this and
+        # fall back to decoding the writer's answer and re-tokenizing with the
+        # editor's tokenizer (round-trip through text).
+        editor_vocab = editor_backend.model.get_input_embeddings().num_embeddings
+        if writer_backend is not editor_backend and any(
+            t < 0 or t >= editor_vocab for t in writer_toks
+        ):
+            writer_text = state.get("writer_output_text") or \
+                          writer_backend.tokenizer.decode(writer_toks, skip_special_tokens=True)
+            writer_toks = editor_backend.tokenizer(
+                writer_text, add_special_tokens=False
+            )["input_ids"]
+            if hasattr(writer_toks, "tolist"):
+                writer_toks = writer_toks.tolist()
+            if writer_toks and isinstance(writer_toks[0], list):
+                writer_toks = writer_toks[0]
+            writer_toks = [int(x) for x in writer_toks]
+
         spliced = pre_ids + writer_toks + post_ids
         draft_start = len(pre_ids)
         draft_end = draft_start + len(writer_toks)
