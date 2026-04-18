@@ -148,6 +148,55 @@ def _probe_layers(num_layers: int) -> List[int]:
     return [max(1, num_layers // 2)]
 
 
+def _split_prompt_at_marker(
+    backend: ModelBackend,
+    system: str,
+    user: str,
+    marker: str,
+) -> Tuple[List[int], List[int]]:
+    """
+    Render the chat prompt as plain text (tokenize=False), split at ``marker``,
+    then tokenize each half independently.
+
+    Returns (pre_ids, post_ids) so that::
+
+        spliced = pre_ids + <content_ids> + post_ids
+
+    gives a coherent prompt sequence without ever needing _find_sublist.
+
+    This sidesteps the BPE tokenization-context problem where ``marker`` can
+    tokenise differently when embedded in the full string vs. when encoded in
+    isolation (which caused the old _find_sublist approach to fail on Qwen3.5).
+    """
+    tok = backend.tokenizer
+    messages: List[dict] = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": user})
+
+    template_kw = {**backend._chat_template_kwargs}
+    common: dict = dict(add_generation_prompt=True, tokenize=False)
+    try:
+        full_text: str = tok.apply_chat_template(messages, **common, **template_kw)
+    except TypeError:
+        full_text = tok.apply_chat_template(messages, **common)
+
+    if marker not in full_text:
+        raise RuntimeError(
+            f"Marker {marker!r} absent from rendered prompt text. "
+            "The chat template may be escaping or altering the marker string."
+        )
+
+    pre_text, post_text = full_text.split(marker, 1)
+
+    # Tokenize each half as a plain string; the special tokens are already
+    # embedded as text by apply_chat_template, so add_special_tokens=False.
+    pre_ids: List[int] = tok(pre_text, add_special_tokens=False)["input_ids"]
+    post_ids: List[int] = tok(post_text, add_special_tokens=False)["input_ids"]
+    return pre_ids, post_ids
+
+
+
 def _build_inject_prompt(
     backend: ModelBackend,
     marker: str,
@@ -159,26 +208,17 @@ def _build_inject_prompt(
     Build an editor prompt where `marker` is replaced by `num_placeholders`
     dummy tokens.  Returns (prompt_ids tensor, list of placeholder positions).
     """
+    pre_ids, post_ids = _split_prompt_at_marker(
+        backend, system, user_template, marker
+    )
+
     tok = backend.tokenizer
-    full_ids = backend.build_chat_prompt(system, user_template)[0].tolist()
-
-    marker_ids = tok.encode(marker, add_special_tokens=False)
-    marker_pos = _find_sublist(full_ids, marker_ids)
-    if marker_pos < 0:
-        raise RuntimeError(
-            f"Marker {marker!r} not found in rendered editor prompt. "
-            "The chat template may be inserting extra tokens around the marker."
-        )
-
     ph_id = tok.pad_token_id if tok.pad_token_id is not None else tok.bos_token_id
     if ph_id is None:
         ph_id = 0
 
-    spliced = (
-        full_ids[:marker_pos]
-        + [ph_id] * num_placeholders
-        + full_ids[marker_pos + len(marker_ids):]
-    )
+    marker_pos = len(pre_ids)
+    spliced = pre_ids + [ph_id] * num_placeholders + post_ids
     ph_positions = list(range(marker_pos, marker_pos + num_placeholders))
     prompt_ids = torch.tensor([spliced], dtype=torch.long, device=backend.device)
     return prompt_ids, ph_positions
@@ -231,31 +271,19 @@ def make_probe_nodes(
     # ── Arm A: editor with raw text ──────────────────────────────────────────
 
     def probe_editor(state: SelfieProbeMixin) -> SelfieProbeMixin:
-        tok = editor_backend.tokenizer
         device = editor_backend.device
 
-        # Build the editor prompt by splicing the writer's token IDs around the
-        # draft marker.  This preserves exact token alignment for SELFIE later.
-        full_ids = editor_backend.build_chat_prompt(
-            _EDITOR_SYSTEM, _EDITOR_USER_TEXT
-        )[0].tolist()
-
-        marker_ids = tok.encode(_DRAFT_MARKER, add_special_tokens=False)
-        marker_pos = _find_sublist(full_ids, marker_ids)
-        if marker_pos < 0:
-            raise RuntimeError(
-                f"Draft marker not found in rendered editor prompt. "
-                "Chat template may be altering special character sequences."
-            )
+        # Build the editor prompt by splitting at the draft marker in plain text
+        # and splicing writer token IDs in between.  Avoids the BPE context
+        # problem that caused _find_sublist to fail on Qwen3.5.
+        pre_ids, post_ids = _split_prompt_at_marker(
+            editor_backend, _EDITOR_SYSTEM, _EDITOR_USER_TEXT, _DRAFT_MARKER
+        )
 
         writer_toks = state["writer_output_token_ids"]
-        spliced = (
-            full_ids[:marker_pos]
-            + writer_toks
-            + full_ids[marker_pos + len(marker_ids):]
-        )
-        draft_start = marker_pos
-        draft_end = marker_pos + len(writer_toks)
+        spliced = pre_ids + writer_toks + post_ids
+        draft_start = len(pre_ids)
+        draft_end = draft_start + len(writer_toks)
 
         editor_prompt_ids = torch.tensor([spliced], dtype=torch.long, device=device)
 
