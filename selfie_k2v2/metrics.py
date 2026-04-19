@@ -98,14 +98,17 @@ def communication_gap(
     p_txt = txt.softmax(dim=-1)
 
     # Jensen-Shannon divergence: JS(P||Q) = 0.5*KL(P||M) + 0.5*KL(Q||M)
+    # Computed in nats, then normalised by log(2) so the result is in [0, 1]
+    # (identical to using log base-2; 0 = identical distributions, 1 = maximally different).
+    import math as _math
     m = 0.5 * (p_lat + p_txt)
     log_p_lat = (p_lat + eps).log()
     log_p_txt = (p_txt + eps).log()
     log_m = (m + eps).log()
     kl_lat_m = (p_lat * (log_p_lat - log_m)).sum(dim=-1)
     kl_txt_m = (p_txt * (log_p_txt - log_m)).sum(dim=-1)
-    js_t = 0.5 * (kl_lat_m + kl_txt_m)
-    js_t = js_t.clamp_min(0.0)  # numerical: JS is non-negative
+    js_t = 0.5 * (kl_lat_m + kl_txt_m) / _math.log(2)
+    js_t = js_t.clamp(0.0, 1.0)  # numerical: JS in bits is in [0, 1]
 
     # Cosine-based logit distance
     cos_t = 1.0 - F.cosine_similarity(lat, txt, dim=-1)
