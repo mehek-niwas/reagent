@@ -7,7 +7,7 @@
 
 ## Abstract
 
-Multi-agent systems (MAS) built on large language models (LLMs) increasingly rely on natural language as the default communication substrate. Yet natural language is a lossy channel: the continuous internal state of a sending agent must be discretized into tokens before it reaches a receiving agent, inevitably discarding latent reasoning. Despite growing interest in richer communication protocols (e.g., state-delta injection, probability-weighted embeddings), it remains unclear *how* a receiving agent internally represents the content it reads from a sender—and whether that internal representation faithfully preserves the sender's intent. We introduce a three-arm framework that places a **Writer agent** and an **Editor agent** in a pairwise communication scenario and applies SelfIE-style probing (Chen et al., 2024) to compare hidden representations across three communication conditions: (1) SelfIE applied directly to the Writer's output tokens, (2) direct hidden-state injection of the Writer's final layer embeddings into the Editor's forward pass, and (3) natural-language transmission followed by SelfIE probing of the Editor's internal encoding of those tokens. We quantify representational fidelity using Jensen-Shannon (JS) divergence and cosine similarity between paired embedding sets. Experiments are conducted on Qwen (12 layers, 12 heads, 110M parameters) using the CoQA dataset as a conversational grounding task. Our results illuminate systematic gaps between what a sender encodes and what a receiver internally represents—gaps that we argue are a root cause of emergent failure modes in agentic workflows.
+Multi-agent systems (MAS) built on large language models (LLMs) increasingly rely on natural language as the default communication substrate. Yet natural language is a lossy channel: the continuous internal state of a sending agent must be discretized into tokens before it reaches a receiving agent, inevitably discarding latent reasoning. Despite growing interest in richer communication protocols (e.g., state-delta injection, probability-weighted embeddings), it remains unclear *how* a receiving agent internally represents the content it reads from a sender—and whether that internal representation faithfully preserves the sender's intent. We introduce a two-arm framework that places a **Writer agent** and an **Editor agent** in a pairwise communication scenario and compares two communication conditions: (1) **Arm B** — direct hidden-state injection of the Writer's final-layer embeddings into the Editor's forward pass, and (2) **Arm C** — natural-language transmission followed by SelfIE probing (Chen et al., 2024) of the Editor's internal encoding of those tokens. Comparing these two arms directly reveals how much representational information is preserved or distorted when agent communication is constrained to natural language. We quantify representational fidelity using Jensen-Shannon (JS) divergence and cosine similarity between paired embedding sets. Experiments are conducted on Qwen (12 layers, 12 heads, 110M parameters) using the CoQA dataset as a conversational grounding task. Our results illuminate systematic gaps between what a sender encodes and what a receiver internally represents—gaps that we argue are a root cause of emergent failure modes in agentic workflows.
 
 ---
 
@@ -21,7 +21,7 @@ Prior work has begun to address the transmission side of this problem. Tang et a
 
 SelfIE (Chen et al., 2024) provides a complementary tool. By inserting hidden embeddings into a separate interpretation forward pass, SelfIE allows an LLM to generate natural-language descriptions of its own latent states—without any additional training. This opens the possibility of probing what the *sender* encodes at generation time and comparing it to what the *receiver* encodes when reading that message.
 
-We combine these threads to ask a focused empirical question: **to what degree does a receiver agent's internal representation of a sender's message match the sender's own internal representation of that message, and how does this alignment change across communication methods?** To operationalize this, we instantiate a Writer–Editor agent pair and compare three conditions along representational and information-theoretic axes.
+We combine these threads to ask a focused empirical question: **how does a receiver agent's internal representation of a sender's message differ between direct latent transfer and natural-language communication, and where in the model do these representations diverge most?** To operationalize this, we instantiate a Writer–Editor agent pair and compare two conditions along representational and information-theoretic axes.
 
 ---
 
@@ -58,27 +58,21 @@ All experiments use **Qwen** with the following configuration:
 
 Qwen was selected based on practical considerations discussed in Section 6 (see Future Work). The CoQA conversational question-answering dataset is used as a grounding task because it requires multi-turn reasoning and context tracking—properties that stress-test inter-agent communication.
 
+
+
 ### 3.3 Communication Methods
 
-We compare three communication conditions, each varying in how the Writer's internal state is made available to the Editor:
-
-**Arm A — Writer SelfIE (Baseline Sender Representation).** We run a standard forward pass of the Writer on its input prompt and generated output. For each output token of interest, we apply SelfIE at a designated layer $\ell^*$: the hidden embedding $h^{\ell^*}_{i^*}$ is injected into a separate interpretation forward pass, and the model generates a natural-language description of the embedding. This produces the *sender's self-representation* of its output—a reference signal against which the receiver's representation can be compared.
-
-Formally, following Chen et al. (2024), the interpretation forward pass modifies the standard transformer computation at layer $k$ and placeholder index $s$:
-
-$$\bar{h}^{\ell}_{i} = h^{\ell^*}_{i^*}, \quad \ell = k,\ i = s$$
-
-with all other layers proceeding normally. The resulting generated text constitutes the SelfIE interpretation.
+We compare two communication conditions, each varying in how the Writer's internal state is made available to the Editor.
 
 **Arm B — Hidden-State Injection (Direct Latent Transfer).** Rather than transmitting the Writer's output as natural language, we inject the Writer's final-layer hidden embeddings directly into the Editor's forward pass at the token positions corresponding to the Writer's output. Specifically, for Writer output tokens $t_1, \ldots, t_n$ with final hidden states $H^L_{\text{Writer}} = \{h^L_1, \ldots, h^L_n\}$, the Editor's prompt is constructed with *placeholder tokens* at the positions where the Writer's output would normally appear. During the Editor's forward pass, each placeholder token's embedding at a chosen injection layer $\ell_{\text{inject}}$ is replaced by the corresponding Writer hidden state:
 
 $$h^{\ell_{\text{inject}}}_{\text{Editor}, j} \leftarrow h^L_{\text{Writer}, i} \quad \text{if position } j \text{ corresponds to token } t_i$$
 
-This is conceptually similar to the approach in Du et al. (2026) and Ramesh and Li (2025). After injection, we apply SelfIE to the Editor's modified embeddings to obtain the *receiver's representation under direct latent transfer*.
+This is conceptually similar to the latent-communication approach in Du et al. (2026) and Ramesh and Li (2025). After injection, we apply SelfIE to the Editor's modified embeddings to obtain the *receiver's representation under direct latent transfer*.
 
-**Arm C — Natural Language + Editor SelfIE (Standard Communication).** The Writer's output is transmitted as natural language and inserted into the Editor's prompt. The Editor processes this prompt through a standard forward pass. We then identify the token positions in the Editor's prompt that correspond to the Writer's output (i.e., the tokens of the message being read) and apply SelfIE at layer $\ell^*$ to each of these positions. This yields the *receiver's internal representation of the sender's message under natural-language communication*.
+**Arm C — Natural Language + Editor SelfIE (Standard Communication).** The Writer's output is transmitted as natural language and inserted into the Editor's prompt. The Editor processes this prompt through a standard forward pass. We then identify the token positions in the Editor's prompt that correspond to the Writer's output and apply SelfIE at layer $\ell^*$ to each of these positions. This yields the *receiver's internal representation of the sender's message under natural-language communication*.
 
-The critical comparison is between **Arm A** (what the Writer internally encodes) and **Arm C** (what the Editor internally encodes when reading the Writer's natural-language output). Any divergence between these captures the representational loss incurred by natural-language transmission.
+The core comparison is between **Arm B** (Editor's representation when the Writer's latent states are transferred directly) and **Arm C** (Editor's representation when communication is mediated through natural language). Any divergence between these two conditions captures the representational loss specifically attributable to the natural-language bottleneck.
 
 ### 3.4 Comparison Metrics
 
@@ -96,15 +90,15 @@ $$\text{cos}(\mathbf{u}, \mathbf{v}) = \frac{\mathbf{u} \cdot \mathbf{v}}{\|\mat
 
 We report $1 - \text{cos}(\mathbf{u}, \mathbf{v})$ (cosine distance) so that higher values indicate greater divergence, consistent with JSD. Cosine distance captures directional misalignment in representation space independent of magnitude.
 
-Following the Communication Gap formulation in our code (see experiment notebook), we combine these metrics into a single per-step score:
+Following the Communication Gap formulation in our experiment code, we combine these metrics into a single per-step score applied pairwise between Arm B and Arm C representations:
 
 $$\text{CG}_t = \beta \cdot \text{JS}_t + \alpha \cdot (1 - \text{cos}_t)$$
 
-with $\alpha = \beta = 0.5$ as default weights, and average over all $T$ tokens in the Writer's message:
+with $\alpha = \beta = 0.5$ as default weights, averaged over all $T$ tokens in the Writer's message:
 
 $$\text{CG} = \frac{1}{T} \sum_{t=1}^{T} \text{CG}_t$$
 
-where $\text{JS}_t \in [0, 1]$ bits and $1 - \text{cos}_t \in [0, 2]$.
+where $\text{JS}_t \in [0, 1]$ bits and $1 - \text{cos}_t \in [0, 2]$. A higher CG score indicates that the Editor's internal representation is more divergent under natural-language communication (Arm C) than under direct latent transfer (Arm B), pointing to specific tokens and layers where the natural-language channel loses information.
 
 ### 3.5 Dataset
 
@@ -116,56 +110,55 @@ For CraigslistBargains, each example produces: (1) a buyer LLM generating an ope
 
 ## 4. Diagrams
 
-### Figure 1: Overview of the Three-Arm Communication Framework
+### Figure 1: Overview of the Two-Arm Communication Framework
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                   WRITER-EDITOR COMMUNICATION FRAMEWORK                 │
 └─────────────────────────────────────────────────────────────────────────┘
 
-   Writer Agent                              Editor Agent
-  ┌──────────────┐                          ┌──────────────┐
-  │  Input Prompt│                          │  Response    │
-  │  + Task      │                          │  Generation  │
-  └──────┬───────┘                          └──────────────┘
-         │ Forward Pass                            ▲
-         ▼                                         │
-  ┌──────────────┐                                 │
-  │ h^1,...,h^L  │  ←── Hidden states at each layer│
-  │ (per token)  │                                 │
-  └──────┬───────┘                                 │
-         │                                         │
-  ┌──────▼──────────────────────────────────────── ┤
-  │         THREE COMMUNICATION ARMS               │
-  ├─────────────────────────────────────────────── ┤
-  │                                                │
-  │  ARM A: SelfIE on Writer Output               │
-  │  ─────────────────────────────                │
-  │  h^{ℓ*}_{i*} → Interpretation Prompt         │
-  │  → Writer's self-description of token         │
-  │  [Reference: "what was sent"]                 │
-  │                                                │
-  │  ARM B: Direct Hidden-State Injection         │
-  │  ────────────────────────────────             │
-  │  h^L_Writer → placeholder tokens             │
-  │  → injected at ℓ_inject in Editor            │
-  │  → SelfIE on Editor's modified states        │
-  │  [What Editor represents via latent transfer] │
-  │                                                │
-  │  ARM C: Natural Language + Editor SelfIE     │
-  │  ─────────────────────────────────────        │
-  │  Tokens t_1,...,t_n → Editor prompt          │
-  │  → Editor forward pass                       │
-  │  → SelfIE on Editor's encoding of tokens     │
-  │  [What Editor represents via NL channel]     │
-  └────────────────────────────────────────────── ┘
-         │                         │
-         ▼                         ▼
-    CG(A vs C): NL Gap       CG(A vs B): Latent Gap
-    JSD + Cosine Distance    JSD + Cosine Distance
+   Writer Agent
+  ┌──────────────────────┐
+  │  Input Prompt + Task │
+  └──────────┬───────────┘
+             │ Forward Pass
+             ▼
+  ┌──────────────────────┐
+  │  h^1, ..., h^L       │  Hidden states at each layer, per output token
+  │  (t_1, ..., t_n)     │
+  └──────────┬───────────┘
+             │
+     ┌───────┴────────┐
+     │                │
+     ▼                ▼
+┌─────────────┐  ┌──────────────────────────┐
+│   ARM B     │  │         ARM C            │
+│  ─────────  │  │  ──────────────────────  │
+│  h^L_Writer │  │  Tokens t_1,...,t_n      │
+│  → placeholder  │  → inserted into Editor  │
+│    tokens   │  │    prompt as natural     │
+│  → inject at│  │    language              │
+│  ℓ_inject   │  │  → standard Editor       │
+│  in Editor  │  │    forward pass          │
+│  → SelfIE   │  │  → SelfIE on Editor's    │
+│    on Edito │  │    encoding of t_1..t_n  │
+│    r states │  │                          │
+└──────┬──────┘  └───────────┬──────────────┘
+       │                     │
+       │    Editor Agent     │
+       ▼                     ▼
+  ┌─────────────────────────────────────────┐
+  │     COMPARISON: Arm B vs. Arm C         │
+  │                                         │
+  │   CG(B, C) = β·JSD(P_B, P_C)           │
+  │            + α·(1 − cos(h_B, h_C))     │
+  │                                         │
+  │   Higher CG → more information lost    │
+  │   in the natural-language channel       │
+  └─────────────────────────────────────────┘
 ```
 
-*Suggested rendered diagram: A three-panel horizontal flow diagram showing (left) the Writer agent with its forward-pass layers highlighted, (center) three arrows branching downward labeled Arm A/B/C, and (right) the Editor agent with its layers highlighted. Arrows at the bottom converge to a comparison block showing JSD and cosine similarity scores.*
+*Suggested rendered diagram: A forked-flow diagram with the Writer's layer stack on the left splitting into two labeled paths (Arm B = latent injection, Arm C = natural language), each entering the Editor's layer stack. Both paths terminate at a shared comparison block at the bottom showing CG score decomposition.*
 
 ---
 
@@ -202,61 +195,64 @@ $$\text{CG}_t = \underbrace{\beta \cdot \text{JS}_t}_{\text{distributional diver
 ```
 For each token t in Writer's output:
 
-  Writer's distribution P_t ──────────────────┐
-  (via LM head on h^{ℓ*}_{Writer,t})          ├─▶ JSD(P_t, Q_t) × β
-  Editor's distribution Q_t ──────────────────┘
+  Arm B distribution P^B_t ───────────────────┐
+  (Editor under latent injection)              ├─▶ JSD(P^B_t, P^C_t) × β
+  Arm C distribution P^C_t ───────────────────┘
+  (Editor under natural language)
 
-  Writer's embedding u_t ─────────────────────┐
-  (hidden state at layer ℓ*)                  ├─▶ (1 - cos(u_t, v_t)) × α
-  Editor's embedding v_t ─────────────────────┘
+  Arm B embedding h^B_t ──────────────────────┐
+  (Editor hidden state, injection path)        ├─▶ (1 - cos(h^B_t, h^C_t)) × α
+  Arm C embedding h^C_t ──────────────────────┘
+  (Editor hidden state, NL path)
 
   CG_t = weighted sum of both terms
 
   Final CG = (1/T) Σ CG_t  over all T tokens
+  Higher CG → natural language loses more of the latent signal
 ```
 
-*Suggested rendered diagram: A two-row visualization showing token positions along the x-axis, with a filled area chart showing β·JS contribution in coral and α·(1−cos) contribution in steel blue, and a black line for per-step CG—matching the style of Plot 6 in the experimental code.*
+*Suggested rendered diagram: A two-row area chart with token position on the x-axis. β·JS contribution shown in coral, α·(1−cos) in steel blue, and a black line for per-step CG—matching the style of the per-step breakdown plots in the experimental code. Pairs of high-CG tokens can be annotated with their SelfIE descriptions from each arm to show qualitatively what information diverges.*
 
 ---
 
-### Figure 4: Representational Alignment Across Communication Arms
+
+
+### Figure 4: Communication Gap Across Layers — Arm B vs. Arm C
 
 *(Placeholder — to be populated once Results are complete)*
 
 ```
-      Cosine Distance (Writer vs. Editor Representation)
+      CG Score (Arm B vs. Arm C)
       ────────────────────────────────────────────────────
  High │
       │   ■  ■  ■  ■     ← Arm C (Natural Language)
-      │
-      │   ▲  ▲  ▲  ▲     ← Arm B (Injection, mid layers)
+      │                    higher CG = more info lost
  Low  │
-      │   ●  ●  ●  ●     ← Arm A (Baseline: Writer self-repr.)
+      │   ▲  ▲  ▲  ▲     ← Arm B (Latent Injection)
+      │                    lower CG = representations closer
       └───────────────────────────────────────────────────▶
            Early         Middle         Late
-                       Transformer Layer
+                       Transformer Layer (injection depth)
 ```
 
-*Suggested rendered diagram: A multi-line plot with three lines (Arm A = Writer SelfIE, Arm B = injection, Arm C = NL) plotted against transformer layer depth on the x-axis and cosine distance on the y-axis, with a shaded confidence band. This directly shows where in the model the representational gap is largest.*
+*Suggested rendered diagram: A two-line plot with Arm B and Arm C CG scores on the y-axis, transformer layer depth on the x-axis, and shaded ±1 std bands. The gap between the two lines at each layer directly quantifies what is lost by the natural-language bottleneck as a function of where in the model the comparison is made.*
 
 ---
-
-## 5. Results
 
 *Results are pending completion of experiments. This section will be updated with quantitative findings.*
 
 Upon completion, this section will report:
 
-- **Communication Gap scores** (mean CG, JS divergence component, cosine distance component) for Arms B and C relative to the Arm A baseline, broken down by CoQA example category and dialogue turn.
+- **Communication Gap scores** (mean CG, JS divergence component, cosine distance component) for Arms B and C, broken down by CoQA example category and dialogue turn.
 - **Layer-wise representational alignment**: how the gap between Writer and Editor representations changes across transformer layers, informing optimal injection depth.
-- **Qualitative SelfIE comparisons**: natural-language descriptions generated by SelfIE for matched tokens in Arms A vs. C, illustrating specific cases where the Editor's internal representation diverges from the Writer's intent.
+- **Qualitative SelfIE comparisons**: natural-language descriptions generated by SelfIE for matched tokens in Arms B vs. C, illustrating specific tokens where the natural-language channel produces interpretively divergent Editor representations relative to direct latent transfer.
 - **Communication method ranking**: whether direct hidden-state injection (Arm B) produces tighter representational alignment than natural language (Arm C), and at which layers this advantage is most pronounced.
 
 ---
 
 ## 6. Discussion
 
-The three-arm framework introduced here draws on complementary prior work to expose a layer of the agent communication problem that performance-centric evaluations miss. Tang et al. (2025) show that SDE outperforms natural language on downstream task accuracy, particularly for complex reasoning; our framework provides a mechanistic explanation for *why*—by showing that natural language transmission creates measurable representational gaps, which SDE-style injection partially closes. Similarly, SelfIE (Chen et al., 2024) was originally developed to interpret individual LLM forward passes in isolation; we extend its application to the *comparative* setting, using it as a bridge between two agents' internal states.
+The two-arm framework introduced here draws on complementary prior work to expose a layer of the agent communication problem that performance-centric evaluations miss. Tang et al. (2025) show that SDE outperforms natural language on downstream task accuracy, particularly for complex reasoning; our framework provides a mechanistic explanation for *why*—by showing that natural language transmission creates measurable representational gaps, which SDE-style injection partially closes. Similarly, SelfIE (Chen et al., 2024) was originally developed to interpret individual LLM forward passes in isolation; we extend its application to the *comparative* setting, using it as a bridge between two agents' internal states.
 
 The Writer–Editor framing is intentionally general. It subsumes common multi-agent patterns: planner–executor, researcher–synthesizer, debater–judge. The CraigslistBargains setting (He et al., 2018) provides a controlled instantiation where the strategic intent of the writer (the buyer's target price and negotiating posture) has a measurable downstream effect on the editor's response (whether a fair deal is reached). This grounding allows us to connect representational gaps to behavioral outcomes.
 
