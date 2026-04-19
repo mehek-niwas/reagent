@@ -12,6 +12,7 @@ from .agents_graph import (
     DEFAULT_WRITER_SELFPROBE_SYSTEM,
     DEFAULT_WRITER_SELFPROBE_USER,
 )
+from .metrics import communication_gap
 from .selfie_fork import InterpretationPrompt, interpret, capture_hidden_states
 
 __all__ = [
@@ -31,6 +32,8 @@ __all__ = [
     "DEFAULT_EDITOR_SYSTEM",
     "DEFAULT_WRITER_SELFPROBE_SYSTEM",
     "DEFAULT_WRITER_SELFPROBE_USER",
+    # metrics
+    "communication_gap",
     # selfie primitives (kept available for anyone who wants to use them
     # directly; not used by the 4-arm probe graph)
     "InterpretationPrompt",

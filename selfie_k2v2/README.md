@@ -15,7 +15,27 @@ LLaMA 3.x, Gemma 3/4, and K2-V2 via a single generic `ModelBackend`.
 All four arms share a single `inject_layer` parameter. Injection is done **all at once** in a single
 vectorised forward pass — not one token at a time.
 
-Cost: **5 `generate()` calls per run** — writer + A + B + C + D.
+### Communication Gap (CG) metric
+
+In addition to the four arms, the graph computes a **Communication Gap** scalar: a weighted mix of
+Jensen-Shannon divergence and logit-cosine distance between the editor's next-token distributions
+on the **text channel** (Arm A input) vs. the **latent channel** (Arm C input). Both channels are
+scored on the **same reference response** (Arm A's verdict) under **teacher forcing**, so the
+number reflects channel difference — not autoregressive prefix drift.
+
+```
+CG = mean_t [ beta · JS_t  +  alpha · COS_t ]
+```
+
+- Low CG → editor behaves similarly under raw text and injected HS (agents speak the same language).
+- High CG → channels disagree, a measurable communication gap between writer and editor.
+
+Available as `final["comm_gap"]` — keys `CG`, `JS_mean`, `COS_mean`, `per_step`, `JS_per_step`,
+`COS_per_step`, `T`. See `selfie_k2v2/metrics.py` for the standalone function and
+`demo.ipynb` §5 for a per-step plot.
+
+Cost: **5 `generate()` calls + 2 fast forward passes per run** — writer + A + B + C + D + CG.
+Pass `run_comm_gap=False` to drop the 2 extra forwards.
 
 ## Layout
 
@@ -23,8 +43,9 @@ Cost: **5 `generate()` calls per run** — writer + A + B + C + D.
 selfie_k2v2/
 ├── model_backend.py    # Generic ModelBackend + HiddenStateProjector (cross-model)
 ├── k2v2_backend.py     # Thin K2-V2 subclass (adds reasoning_effort default)
-├── agents_graph.py     # LangGraph: writer → A → B → C → END
-├── selfie_fork/        # Standalone SELFIE primitives (not used by the 3-arm graph)
+├── agents_graph.py     # LangGraph: writer → A → B → C → D → comm_gap → END
+├── metrics.py          # communication_gap() — Jensen-Shannon + cosine logit distance
+├── selfie_fork/        # Standalone SELFIE primitives (not used by the 4-arm graph)
 ├── demo.ipynb          # Runnable demo
 ├── demo.py             # Plain-Python version of the demo
 └── README.md
@@ -58,6 +79,8 @@ print("A:", final["editor_verdict"])
 print("B:", final["editor_selfhs_verdict"])
 print("C:", final["editor_writerhs_verdict"])
 print("D:", final["writer_selfhs_output"])
+cg = final["comm_gap"]
+print(f"CG: {cg['CG']:.4f}  (JS={cg['JS_mean']:.4f}, 1-cos={cg['COS_mean']:.4f})")
 ```
 
 ### Customising the writer self-probe prompt (Arm D)

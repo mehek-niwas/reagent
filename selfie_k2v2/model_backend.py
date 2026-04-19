@@ -621,3 +621,114 @@ class ModelBackend:
         all_gen_ids = out_ids[0, prompt_len:].tolist()
         _, _, output_text, _ = self._post_process(all_gen_ids)
         return output_text
+
+    # ------------------------------------------------------------------
+    # Teacher-forced forward pass with hidden-state injection
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def forward_with_injected_embeds(
+        self,
+        full_ids: torch.Tensor,                 # (1, prompt_len + T) — prompt + reference response
+        prompt_len: int,
+        placeholder_positions: List[int],
+        injected_hidden: torch.Tensor,          # (num_ph, hidden_size_src)
+        inject_layer: int = 0,
+        projector: Optional[HiddenStateProjector] = None,
+    ) -> torch.Tensor:                          # returns (T, vocab_size) logits
+        """
+        Single teacher-forced forward pass over `full_ids = prompt + response`
+        with the same placeholder-injection mechanism used by
+        generate_with_injected_embeds.
+
+        Returns the next-token logits aligned to each response position:
+            logits[t] = p(response_token[t] | prompt, response[:t])
+
+        where T = full_ids.shape[1] - prompt_len.
+
+        This is the workhorse for the Communication Gap metric: it lets you
+        score the *same* reference response under two different channels (raw
+        text vs injected HS) on matched logits — no autoregressive drift
+        between channels.
+        """
+        full_ids = full_ids.to(self.device)
+        if hasattr(full_ids, "input_ids"):
+            full_ids = full_ids.input_ids
+        if full_ids.dim() == 1:
+            full_ids = full_ids.unsqueeze(0)
+
+        dtype = next(self.model.parameters()).dtype
+
+        h = injected_hidden
+        if projector is not None:
+            h = projector(h)
+        injected = h.to(device=self.device, dtype=dtype)
+
+        if injected.shape[0] != len(placeholder_positions):
+            raise ValueError(
+                f"injected rows {injected.shape[0]} != "
+                f"num placeholder positions {len(placeholder_positions)}"
+            )
+        if injected.shape[-1] != self.hidden_size:
+            raise ValueError(
+                f"Hidden dim after projection ({injected.shape[-1]}) != "
+                f"model hidden_size ({self.hidden_size})."
+            )
+
+        ph_idx = torch.as_tensor(placeholder_positions, device=self.device, dtype=torch.long)
+
+        def _patch(hidden: torch.Tensor) -> torch.Tensor:
+            # Single forward pass covers the full sequence, so this runs once.
+            if hidden.shape[1] >= prompt_len:
+                hidden[:, ph_idx, :] = injected
+            return hidden
+
+        handles = []
+        if inject_layer == 0:
+            embed = self.model.get_input_embeddings()
+            handles.append(embed.register_forward_hook(lambda m, i, o: _patch(o)))
+        else:
+            target_idx = min(inject_layer - 1, self.num_layers - 1)
+            layer = self._layers[target_idx]
+
+            def _pre_hook(module, args, kwargs):
+                if args and torch.is_tensor(args[0]):
+                    return (_patch(args[0]),) + args[1:], kwargs
+                if "hidden_states" in kwargs:
+                    return args, {**kwargs, "hidden_states": _patch(kwargs["hidden_states"])}
+                return args, kwargs
+
+            handles.append(layer.register_forward_pre_hook(_pre_hook, with_kwargs=True))
+
+        attention_mask = torch.ones_like(full_ids)
+        try:
+            out = self.model(input_ids=full_ids, attention_mask=attention_mask)
+        finally:
+            for h_ in handles:
+                h_.remove()
+
+        # logits[:, i, :] predicts token i+1.  To score each response token
+        # we take positions [prompt_len - 1, prompt_len, ..., full_len - 2].
+        full_len = full_ids.shape[1]
+        return out.logits[0, prompt_len - 1 : full_len - 1, :].detach()
+
+    @torch.no_grad()
+    def forward_plain(
+        self,
+        full_ids: torch.Tensor,
+        prompt_len: int,
+    ) -> torch.Tensor:
+        """
+        Teacher-forced forward pass with NO injection.  Mirror of
+        forward_with_injected_embeds() for the text channel of the CG metric.
+        Returns (T, vocab_size) next-token logits aligned to response tokens.
+        """
+        full_ids = full_ids.to(self.device)
+        if hasattr(full_ids, "input_ids"):
+            full_ids = full_ids.input_ids
+        if full_ids.dim() == 1:
+            full_ids = full_ids.unsqueeze(0)
+        attention_mask = torch.ones_like(full_ids)
+        out = self.model(input_ids=full_ids, attention_mask=attention_mask)
+        full_len = full_ids.shape[1]
+        return out.logits[0, prompt_len - 1 : full_len - 1, :].detach()

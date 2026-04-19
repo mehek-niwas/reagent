@@ -75,11 +75,12 @@ def main():
         print("\n[!] Empty output. Check model load or chat template.")
         sys.exit(1)
 
-    banner("STEP 3 / 4: Build graph and run 4-arm comparison")
+    banner("STEP 3 / 4: Build graph and run 4-arm comparison + CG metric")
     print("Graph: writer → probe_editor (A) → probe_editor_selfhs (B)")
     print("                                  → probe_editor_writerhs (C)")
-    print("                                  → probe_writer_selfhs  (D) → END")
-    print("Cost: 5 generate() calls total.\n")
+    print("                                  → probe_writer_selfhs  (D)")
+    print("                                  → probe_comm_gap      (CG metric) → END")
+    print("Cost: 5 generate() calls + 2 fast forward passes.\n")
 
     task = "Describe a golden retriever in 3 sentences."
     print(f"Task: {task!r}\n")
@@ -116,6 +117,19 @@ def main():
     print("B ≈ C       →  writer and editor form compatible internal representations.")
     print("D ≈ answer  →  writer's HS genuinely encode the essay content.")
 
+    cg = final.get("comm_gap")
+    if cg and cg.get("T", 0) > 0:
+        subbanner("Communication Gap (text channel vs. latent channel)")
+        print(f"  response length T : {cg['T']} tokens")
+        print(f"  alpha (cosine)    : {cg['alpha']}")
+        print(f"  beta  (JS)        : {cg['beta']}")
+        print(f"  CG                : {cg['CG']:.4f}")
+        print(f"  mean JS           : {cg['JS_mean']:.4f}")
+        print(f"  mean (1 - cos)    : {cg['COS_mean']:.4f}")
+        print()
+        print("Low CG  →  editor behaves similarly under raw text and latent injection.")
+        print("High CG →  measurable communication gap between writer and editor.")
+
     out_dir = os.path.join(_HERE, "outputs")
     os.makedirs(out_dir, exist_ok=True)
 
@@ -128,7 +142,15 @@ def main():
         f.write(f"=== Arm A: editor_verdict (raw text) ===\n{final['editor_verdict']}\n\n")
         f.write(f"=== Arm B: editor_selfhs_verdict ===\n{final['editor_selfhs_verdict']}\n\n")
         f.write(f"=== Arm C: editor_writerhs_verdict ===\n{final['editor_writerhs_verdict']}\n\n")
-        f.write(f"=== Arm D: writer_selfhs_output ===\n{final['writer_selfhs_output']}\n")
+        f.write(f"=== Arm D: writer_selfhs_output ===\n{final['writer_selfhs_output']}\n\n")
+        if cg and cg.get("T", 0) > 0:
+            f.write(f"=== Communication Gap ===\n")
+            f.write(f"T         : {cg['T']}\n")
+            f.write(f"alpha     : {cg['alpha']}\n")
+            f.write(f"beta      : {cg['beta']}\n")
+            f.write(f"CG        : {cg['CG']:.6f}\n")
+            f.write(f"JS_mean   : {cg['JS_mean']:.6f}\n")
+            f.write(f"COS_mean  : {cg['COS_mean']:.6f}\n")
 
     print(f"\nOutputs written to: {out_dir}/arm_verdicts.txt")
     banner("DONE")
