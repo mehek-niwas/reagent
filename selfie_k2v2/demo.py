@@ -75,10 +75,11 @@ def main():
         print("\n[!] Empty output. Check model load or chat template.")
         sys.exit(1)
 
-    banner("STEP 3 / 4: Build graph and run 3-arm comparison")
+    banner("STEP 3 / 4: Build graph and run 4-arm comparison")
     print("Graph: writer → probe_editor (A) → probe_editor_selfhs (B)")
-    print("                                  → probe_editor_writerhs (C) → END")
-    print("Cost: 4 generate() calls total.\n")
+    print("                                  → probe_editor_writerhs (C)")
+    print("                                  → probe_writer_selfhs  (D) → END")
+    print("Cost: 5 generate() calls total.\n")
 
     task = "Describe a golden retriever in 3 sentences."
     print(f"Task: {task!r}\n")
@@ -93,7 +94,7 @@ def main():
     final = graph.invoke({"task": task})
     print(f"\nFull graph run took {time.time() - t0:.1f}s.")
 
-    banner("STEP 4 / 4: Three-arm comparison")
+    banner("STEP 4 / 4: Four-arm comparison")
     subbanner("WRITER OUTPUT (clean — thinking stripped)")
     print(final["writer_output_text"])
 
@@ -106,10 +107,14 @@ def main():
     subbanner("Arm C — EDITOR VERDICT (writer's hidden states injected)")
     print(final["editor_writerhs_verdict"])
 
+    subbanner("Arm D — WRITER SELF-PROBE (writer's hidden states → writer)")
+    print(final["writer_selfhs_output"])
+
     print()
-    print("A ≈ B  →  editor's internal repr and surface text carry the same info.")
-    print("A ≈ C  →  writer's hidden states carry the same info as its text.")
-    print("B ≈ C  →  writer and editor form compatible internal representations.")
+    print("A ≈ B       →  editor's internal repr and surface text carry the same info.")
+    print("A ≈ C       →  writer's hidden states carry the same info as its text.")
+    print("B ≈ C       →  writer and editor form compatible internal representations.")
+    print("D ≈ answer  →  writer's HS genuinely encode the essay content.")
 
     out_dir = os.path.join(_HERE, "outputs")
     os.makedirs(out_dir, exist_ok=True)
@@ -122,7 +127,8 @@ def main():
         f.write(f"=== Writer output (clean) ===\n{final['writer_output_text']}\n\n")
         f.write(f"=== Arm A: editor_verdict (raw text) ===\n{final['editor_verdict']}\n\n")
         f.write(f"=== Arm B: editor_selfhs_verdict ===\n{final['editor_selfhs_verdict']}\n\n")
-        f.write(f"=== Arm C: editor_writerhs_verdict ===\n{final['editor_writerhs_verdict']}\n")
+        f.write(f"=== Arm C: editor_writerhs_verdict ===\n{final['editor_writerhs_verdict']}\n\n")
+        f.write(f"=== Arm D: writer_selfhs_output ===\n{final['writer_selfhs_output']}\n")
 
     print(f"\nOutputs written to: {out_dir}/arm_verdicts.txt")
     banner("DONE")

@@ -18,13 +18,21 @@ Three-arm comparison
       Isolates "how much information the writer communicates via its hidden
       states vs. its decoded surface tokens."
 
-Comparing A, B, and C lets you characterise agent communication loss:
-  A ≈ B  →  the editor's internal representation of the text carries the same
-            information as the surface tokens (no representational bottleneck).
-  A ≈ C  →  the writer's final hidden states carry the same info as its text.
-  B ≈ C  →  the writer and editor form compatible internal representations.
+  Arm D  (writer_selfhs_output)
+      Writer self-probe: the WRITER's final-layer hidden states (full-sentence
+      answer) are injected back into the WRITER itself with a user-configurable
+      prompt (default: "repeat/describe this message").  Sanity check that the
+      HS actually encode the essay content — if Arm D fails to produce coherent
+      text, Arm C (cross-agent) is extremely unlikely to work either.
 
-Total cost per invoke(): 4 generate() calls — writer + A + B + C.
+Comparing A, B, C, D lets you characterise agent communication loss:
+  A ≈ B   →  the editor's internal representation of the text carries the same
+             information as the surface tokens (no representational bottleneck).
+  A ≈ C   →  the writer's final hidden states carry the same info as its text.
+  B ≈ C   →  the writer and editor form compatible internal representations.
+  D ≈ ans →  writer's HS genuinely encode the essay content (foundation for C).
+
+Total cost per invoke(): 5 generate() calls — writer + A + B + C + D.
 
 Pluggable API
 ─────────────
@@ -42,7 +50,7 @@ Pluggable API
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, List, Tuple, TypedDict
+from typing import Any, Dict, List, Optional, Tuple, TypedDict
 
 import torch
 from langgraph.graph import END, StateGraph
@@ -53,17 +61,30 @@ from .model_backend import GenerationResult, HiddenStateProjector, ModelBackend
 # ---------------------------------------------------------------------------
 # Prompt templates
 # ---------------------------------------------------------------------------
+#
+# Every prompt below is overridable at graph-build time:
+#
+#   make_graph(..., writer_system=..., editor_system=...,
+#              writer_selfprobe_system=..., writer_selfprobe_user=...)
+#
+# The editor's *user* prompts are not user-configurable because they embed
+# special markers ("<<<DRAFT_TOKENS>>>", "<<<INJECT_HERE>>>") that are load-
+# bearing for the token-splicing logic.
 
-_WRITER_SYSTEM = (
+DEFAULT_WRITER_SYSTEM = (
     "You are a helpful writing assistant. "
     "Write a clear, concise paragraph (3–4 sentences) on the topic provided."
 )
 
-_EDITOR_SYSTEM = (
+DEFAULT_EDITOR_SYSTEM = (
     "You are a critical editor. "
     "Evaluate the draft between <DRAFT> and </DRAFT>. "
     "Give one short sentence of feedback: is it clear? Is anything missing?"
 )
+
+# Internal aliases
+_WRITER_SYSTEM = DEFAULT_WRITER_SYSTEM
+_EDITOR_SYSTEM = DEFAULT_EDITOR_SYSTEM
 
 _DRAFT_MARKER = "<<<DRAFT_TOKENS>>>"
 _INJECT_MARKER = "<<<INJECT_HERE>>>"
@@ -73,6 +94,21 @@ _EDITOR_USER_TEXT = (
 )
 _EDITOR_USER_INJECT = (
     f"Please evaluate this draft:\n<DRAFT>{_INJECT_MARKER}</DRAFT>\nYour feedback:"
+)
+
+# ── Writer self-probe (Arm D) ────────────────────────────────────────────────
+# The writer's own final-layer HS (over its full answer) are injected back into
+# the writer.  The user-prompt below MUST contain exactly one `_INJECT_MARKER`
+# — that's where the HS get spliced into the residual stream.
+#
+# Prompt format mirrors the SELFIE interpretation template (single-quote frame
+# + continuation primer), which is proven to work for hidden-state probing.
+# XML-style tags like <MSG>...</MSG> were tried first but caused the model to
+# fixate on the framing tokens and emit "<MSG><MSG><MSG>..." loops.
+DEFAULT_WRITER_SELFPROBE_SYSTEM = "You are a helpful assistant."
+DEFAULT_WRITER_SELFPROBE_USER = (
+    f"The following is a message: '{_INJECT_MARKER}'.\n"
+    "Repeated word-for-word, the message says:"
 )
 
 
@@ -107,6 +143,9 @@ class ProbeMixin(TypedDict, total=False):
 
     # Arm C
     editor_writerhs_verdict: str
+
+    # Arm D: writer's own HS re-injected into the writer (self-probe)
+    writer_selfhs_output: str
 
 
 # Backwards-compat alias so existing imports keep working
@@ -186,14 +225,16 @@ def _split_prompt_at_marker(
 def _build_inject_prompt(
     backend: ModelBackend,
     num_placeholders: int,
+    system: str = _EDITOR_SYSTEM,
+    user: str = _EDITOR_USER_INJECT,
+    marker: str = _INJECT_MARKER,
 ) -> Tuple[torch.Tensor, List[int]]:
     """
-    Build an editor prompt where the inject-marker is replaced by
-    `num_placeholders` dummy tokens.  Returns (prompt_ids, placeholder_positions).
+    Build a prompt where ``marker`` (inside ``user``) is replaced by
+    ``num_placeholders`` dummy tokens.  Returns (prompt_ids, placeholder_positions).
+    Used by Arm B / Arm C (editor prompts) and Arm D (writer self-probe prompt).
     """
-    pre_ids, post_ids = _split_prompt_at_marker(
-        backend, _EDITOR_SYSTEM, _EDITOR_USER_INJECT, _INJECT_MARKER
-    )
+    pre_ids, post_ids = _split_prompt_at_marker(backend, system, user, marker)
     tok = backend.tokenizer
     ph_id = tok.pad_token_id if tok.pad_token_id is not None else (tok.bos_token_id or 0)
 
@@ -212,14 +253,19 @@ def make_probe_nodes(
     writer_backend: ModelBackend,
     editor_backend: ModelBackend,
     max_editor_tokens: int = 60,
+    max_writer_selfprobe_tokens: int = 80,
     inject_layer: int = 0,
+    editor_system: Optional[str] = None,
+    writer_selfprobe_system: Optional[str] = None,
+    writer_selfprobe_user: Optional[str] = None,
     verbose_timing: bool = False,
 ) -> Dict[str, Any]:
     """
-    Build the three probe nodes and return them as a dict:
+    Build the four probe nodes and return them as a dict:
       "probe_editor"          → Arm A (raw text → editor, captures editor HS for Arm B)
       "probe_editor_selfhs"   → Arm B (editor's own draft HS re-injected)
       "probe_editor_writerhs" → Arm C (writer's answer HS injected into editor)
+      "probe_writer_selfhs"   → Arm D (writer's answer HS re-injected into writer)
 
     Parameters
     ----------
@@ -227,9 +273,14 @@ def make_probe_nodes(
         Same instance for single-model experiments, or different instances for
         cross-model.  HiddenStateProjector handles hidden-size mismatches.
     inject_layer : int
-        Single layer at which to inject hidden states in Arm B and Arm C.
+        Single layer at which to inject hidden states in Arms B, C, and D.
         0 = embedding-layer output; L > 0 = input to decoder layer L
         (1-indexed, matches HF hidden_states[L] convention).
+    writer_selfprobe_system / writer_selfprobe_user : str, optional
+        Custom prompts for Arm D.  The user-prompt MUST contain exactly one
+        `<<<INJECT_HERE>>>` marker — that's where the writer's HS are spliced.
+        Defaults to DEFAULT_WRITER_SELFPROBE_SYSTEM / DEFAULT_WRITER_SELFPROBE_USER
+        (a "repeat this message" reconstruction prompt).
     verbose_timing : bool
         Print wall-clock time per arm so you can see where time goes.
 
@@ -237,9 +288,21 @@ def make_probe_nodes(
     State keys written:
         editor_prompt_ids, editor_draft_start, editor_draft_end,
         editor_result, editor_verdict,
-        editor_selfhs_verdict, editor_writerhs_verdict
+        editor_selfhs_verdict, editor_writerhs_verdict,
+        writer_selfhs_output
     """
     projector = HiddenStateProjector.between(writer_backend, editor_backend)
+
+    ed_system = editor_system if editor_system is not None else DEFAULT_EDITOR_SYSTEM
+    wsp_system = writer_selfprobe_system if writer_selfprobe_system is not None \
+        else DEFAULT_WRITER_SELFPROBE_SYSTEM
+    wsp_user = writer_selfprobe_user if writer_selfprobe_user is not None \
+        else DEFAULT_WRITER_SELFPROBE_USER
+    if _INJECT_MARKER not in wsp_user:
+        raise ValueError(
+            f"writer_selfprobe_user must contain exactly one {_INJECT_MARKER!r} "
+            "marker indicating where the writer's hidden states should be injected."
+        )
 
     def _timed(name: str, fn):
         if not verbose_timing:
@@ -256,7 +319,7 @@ def make_probe_nodes(
     # ── Arm A: editor sees the raw essay text ────────────────────────────────
     def probe_editor(state: ProbeMixin) -> ProbeMixin:
         pre_ids, post_ids = _split_prompt_at_marker(
-            editor_backend, _EDITOR_SYSTEM, _EDITOR_USER_TEXT, _DRAFT_MARKER
+            editor_backend, ed_system, _EDITOR_USER_TEXT, _DRAFT_MARKER
         )
 
         writer_toks = state["writer_output_token_ids"]
@@ -306,7 +369,10 @@ def make_probe_nodes(
         # Editor's FINAL decoder-layer HS at each draft-token position
         final_hs = er.hidden_states[-1][0, draft_positions, :]   # (N, hidden)
 
-        prompt_ids, ph_positions = _build_inject_prompt(editor_backend, num_ph)
+        prompt_ids, ph_positions = _build_inject_prompt(
+            editor_backend, num_ph,
+            system=ed_system, user=_EDITOR_USER_INJECT, marker=_INJECT_MARKER,
+        )
 
         verdict = editor_backend.generate_with_injected_embeds(
             prompt_ids=prompt_ids,
@@ -328,7 +394,10 @@ def make_probe_nodes(
 
         writer_final_hs = wr.hidden_states[-1][0, writer_out_positions, :]  # (N, src_hs)
 
-        prompt_ids, ph_positions = _build_inject_prompt(editor_backend, num_ph)
+        prompt_ids, ph_positions = _build_inject_prompt(
+            editor_backend, num_ph,
+            system=ed_system, user=_EDITOR_USER_INJECT, marker=_INJECT_MARKER,
+        )
 
         verdict = editor_backend.generate_with_injected_embeds(
             prompt_ids=prompt_ids,
@@ -340,10 +409,36 @@ def make_probe_nodes(
         )
         return {**state, "editor_writerhs_verdict": verdict}
 
+    # ── Arm D: writer's own full-answer HS re-injected into the writer ───────
+    def probe_writer_selfhs(state: ProbeMixin) -> ProbeMixin:
+        wr = state["writer_result"]
+        # Same answer positions as Arm C, but injected into writer_backend.
+        ans_start = wr.prompt_len + wr.answer_offset
+        writer_out_positions = list(range(ans_start, ans_start + len(wr.gen_token_ids)))
+        num_ph = len(writer_out_positions)
+
+        writer_final_hs = wr.hidden_states[-1][0, writer_out_positions, :]  # (N, hidden)
+
+        prompt_ids, ph_positions = _build_inject_prompt(
+            writer_backend, num_ph,
+            system=wsp_system, user=wsp_user, marker=_INJECT_MARKER,
+        )
+
+        output = writer_backend.generate_with_injected_embeds(
+            prompt_ids=prompt_ids,
+            placeholder_positions=ph_positions,
+            injected_hidden=writer_final_hs,
+            inject_layer=inject_layer,
+            max_new_tokens=max_writer_selfprobe_tokens,
+            projector=None,            # same model, no projection
+        )
+        return {**state, "writer_selfhs_output": output}
+
     return {
         "probe_editor":          _timed("probe_editor",          probe_editor),
         "probe_editor_selfhs":   _timed("probe_editor_selfhs",   probe_editor_selfhs),
         "probe_editor_writerhs": _timed("probe_editor_writerhs", probe_editor_writerhs),
+        "probe_writer_selfhs":   _timed("probe_writer_selfhs",   probe_writer_selfhs),
     }
 
 
@@ -357,28 +452,42 @@ def add_probe_to_graph(
     editor_backend: ModelBackend,
     entry_node: str,
     max_editor_tokens: int = 60,
+    max_writer_selfprobe_tokens: int = 80,
     inject_layer: int = 0,
+    editor_system: Optional[str] = None,
+    writer_selfprobe_system: Optional[str] = None,
+    writer_selfprobe_user: Optional[str] = None,
     verbose_timing: bool = False,
 ) -> StateGraph:
     """
-    Attach the 3 probe nodes to `graph` as a linear chain starting from
+    Attach the 4 probe nodes to `graph` as a linear chain starting from
     `entry_node`.  Final node edges to END.
 
         entry_node
           → probe_editor            (Arm A)
           → probe_editor_selfhs     (Arm B)
           → probe_editor_writerhs   (Arm C)
+          → probe_writer_selfhs     (Arm D)
           → END
     """
     nodes = make_probe_nodes(
         writer_backend,
         editor_backend,
         max_editor_tokens=max_editor_tokens,
+        max_writer_selfprobe_tokens=max_writer_selfprobe_tokens,
         inject_layer=inject_layer,
+        editor_system=editor_system,
+        writer_selfprobe_system=writer_selfprobe_system,
+        writer_selfprobe_user=writer_selfprobe_user,
         verbose_timing=verbose_timing,
     )
 
-    order = ["probe_editor", "probe_editor_selfhs", "probe_editor_writerhs"]
+    order = [
+        "probe_editor",
+        "probe_editor_selfhs",
+        "probe_editor_writerhs",
+        "probe_writer_selfhs",
+    ]
     for name in order:
         graph.add_node(name, nodes[name])
     graph.add_edge(entry_node, order[0])
@@ -393,24 +502,32 @@ def make_graph(
     editor_backend: ModelBackend,
     max_writer_tokens: int = 80,
     max_editor_tokens: int = 60,
+    max_writer_selfprobe_tokens: int = 80,
     inject_layer: int = 0,
+    writer_system: Optional[str] = None,
+    editor_system: Optional[str] = None,
+    writer_selfprobe_system: Optional[str] = None,
+    writer_selfprobe_user: Optional[str] = None,
     verbose_timing: bool = False,
 ):
     """
     Build and compile a complete standalone graph:
-        writer → probe_editor (A) → probe_editor_selfhs (B) → probe_editor_writerhs (C) → END
+        writer → probe_editor (A) → probe_editor_selfhs (B)
+               → probe_editor_writerhs (C) → probe_writer_selfhs (D) → END
 
-    Cost: 4 generate() calls per invoke().
+    Cost: 5 generate() calls per invoke().
 
     Returns a compiled LangGraph app; call with:
         final = app.invoke({"task": "your task here"})
     """
     g = StateGraph(AgentState)
 
+    wr_system = writer_system if writer_system is not None else DEFAULT_WRITER_SYSTEM
+
     def writer_node(state: AgentState) -> AgentState:
         t0 = time.time()
         prompt_ids = writer_backend.build_chat_prompt(
-            system=_WRITER_SYSTEM,
+            system=wr_system,
             user=state["task"],
         )
         result = writer_backend.generate(
@@ -437,7 +554,11 @@ def make_graph(
         editor_backend,
         entry_node="writer",
         max_editor_tokens=max_editor_tokens,
+        max_writer_selfprobe_tokens=max_writer_selfprobe_tokens,
         inject_layer=inject_layer,
+        editor_system=editor_system,
+        writer_selfprobe_system=writer_selfprobe_system,
+        writer_selfprobe_user=writer_selfprobe_user,
         verbose_timing=verbose_timing,
     )
 
