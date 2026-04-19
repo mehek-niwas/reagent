@@ -5,9 +5,8 @@ from .agents_graph import (
     make_probe_nodes,
     add_probe_to_graph,
     AgentState,
-    SelfieProbeMixin,
-    DEFAULT_WRITER_SELFPROBE_SYSTEM,
-    DEFAULT_WRITER_SELFPROBE_USER,
+    ProbeMixin,
+    SelfieProbeMixin,  # backwards-compat alias of ProbeMixin
 )
 from .selfie_fork import InterpretationPrompt, interpret, capture_hidden_states
 
@@ -22,10 +21,10 @@ __all__ = [
     "make_probe_nodes",
     "add_probe_to_graph",
     "AgentState",
+    "ProbeMixin",
     "SelfieProbeMixin",
-    "DEFAULT_WRITER_SELFPROBE_SYSTEM",
-    "DEFAULT_WRITER_SELFPROBE_USER",
-    # selfie primitives
+    # selfie primitives (kept available for anyone who wants to use them
+    # directly; not used by the 3-arm probe graph)
     "InterpretationPrompt",
     "interpret",
     "capture_hidden_states",
