@@ -166,11 +166,26 @@ def _find_sublist(haystack: List[int], needle: List[int]) -> int:
     return -1
 
 
-def _probe_layers(num_layers: int) -> List[int]:
-    """Pick two representative probe layers (mid and late)."""
-    if num_layers >= 20:
-        return [num_layers // 2, (3 * num_layers) // 4]
-    return [max(1, num_layers - 1)]
+def _probe_layers(num_layers: int, count: int = 2) -> List[int]:
+    """
+    Pick `count` representative probe layers, evenly spread from mid to late.
+    count=1 → just a single late layer (fastest)
+    count=2 → mid + late (default, balanced)
+    count=3 → early-mid + mid + late
+    """
+    count = max(1, count)
+    if num_layers < 4:
+        return [max(1, num_layers - 1)]
+    # Evenly spaced between num_layers//2 and num_layers-1
+    late = num_layers - 1
+    if count == 1:
+        return [(3 * num_layers) // 4]
+    mid = num_layers // 2
+    if count == 2:
+        return [mid, (3 * num_layers) // 4]
+    # count >= 3
+    step = max(1, (late - mid) // (count - 1))
+    return [mid + step * i for i in range(count - 1)] + [late]
 
 
 def _sample_positions(positions: List[int], max_n: int) -> List[int]:
@@ -291,9 +306,13 @@ def make_probe_nodes(
     selfie_max_new_tokens: int = 15,
     inject_layer: int = 0,
     run_selfie: bool = True,
+    run_self_probe: bool = True,
+    run_arm_b: bool = True,
     selfie_max_positions: int = 8,
+    selfie_num_layers: int = 2,
     writer_selfprobe_system: Optional[str] = None,
     writer_selfprobe_user: Optional[str] = None,
+    verbose_timing: bool = False,
 ) -> Dict[str, Any]:
     """
     Build all probe node functions and return them as a dict.
@@ -330,8 +349,59 @@ def make_probe_nodes(
         (default "<<<INJECT_HERE>>>" — see _INJECT_MARKER); that location is
         where the writer's final hidden states get spliced in.  Pass None to
         use DEFAULT_WRITER_SELFPROBE_SYSTEM / DEFAULT_WRITER_SELFPROBE_USER.
+
+    Speed controls
+    --------------
+    run_selfie : bool (default True)
+        Run SELFIE analysis on writer+editor HS.  Adds 2 * selfie_num_layers
+        generate() calls.  Set False for pure 3-arm comparison (skips analytics).
+    run_self_probe : bool (default True)
+        Run writer self-probe (inject writer's HS back into writer + ask to
+        repeat).  Adds 1 generate() call.  Set False to skip entirely.
+    run_arm_b : bool (default True)
+        Run Arm B (editor's own HS re-injected).  Adds 1 generate() call.  Set
+        False if you only care about the A↔C comparison.
+    selfie_num_layers : int (default 2)
+        Number of SELFIE probe layers.  Each layer costs one generate() call.
+        Set 1 for fastest SELFIE.
+    selfie_max_positions : int (default 8)
+        Max token positions to probe per layer in SELFIE.  Drives batch size,
+        not call count.
+    verbose_timing : bool (default False)
+        Print wall-clock time for each probe node so you can see where the
+        time goes.
+
+    Minimum work per call (generate()-count reference):
+      writer (entry)              : 1
+      probe_editor (Arm A)        : 1  (captures HS)
+      probe_editor_selfhs (Arm B) : 1  (skipped if run_arm_b=False)
+      probe_editor_writerhs (C)   : 1
+      probe_writer_selfprobe      : 1  (skipped if run_self_probe=False)
+      probe_selfie_writer         : selfie_num_layers  (skipped if run_selfie=False)
+      probe_selfie_editor         : selfie_num_layers  (skipped if run_selfie=False)
+
+    Lean mode (run_selfie=False, run_self_probe=False, run_arm_b=False):
+        writer + Arm A + Arm C = 3 generate() calls.
     """
     projector = HiddenStateProjector.between(writer_backend, editor_backend)
+
+    # Timer wrapper: lets callers see where the time goes without per-node
+    # instrumentation in user code.  Nodes that short-circuit (run_* = False)
+    # still print so the skip is visible in the trace.
+    import time as _time
+
+    def _timed(name: str, fn):
+        if not verbose_timing:
+            return fn
+
+        def wrapped(state):
+            t0 = _time.time()
+            out = fn(state)
+            dt = _time.time() - t0
+            print(f"  [{name:<24s}] {dt:6.2f}s")
+            return out
+
+        return wrapped
 
     selfprobe_system = (
         writer_selfprobe_system
@@ -408,6 +478,8 @@ def make_probe_nodes(
     # ── Arm B: editor's own hidden states re-injected ────────────────────────
 
     def probe_editor_selfhs(state: SelfieProbeMixin) -> SelfieProbeMixin:
+        if not run_arm_b:
+            return {**state, "editor_selfhs_verdict": "(skipped: run_arm_b=False)"}
         er = state["editor_result"]
         # draft_start/end were set from answer-only token IDs, so they point
         # directly at answer positions inside editor's output_ids.  Cap to
@@ -473,6 +545,8 @@ def make_probe_nodes(
     # Arm C is due to cross-agent communication, not an encoding limitation).
 
     def probe_writer_selfprobe(state: SelfieProbeMixin) -> SelfieProbeMixin:
+        if not run_self_probe:
+            return {**state, "writer_selfprobe_output": "(skipped: run_self_probe=False)"}
         wr = state["writer_result"]
         hs_len = wr.hidden_states[-1].shape[1]
         ans_start = wr.prompt_len + wr.answer_offset
@@ -516,7 +590,7 @@ def make_probe_nodes(
         raw_positions = [t for t in range(ans_start, ans_start + len(wr.gen_token_ids))
                          if t < hs_len]
         out_positions = _sample_positions(raw_positions, selfie_max_positions)
-        probe_layers = _probe_layers(writer_backend.num_layers)
+        probe_layers = _probe_layers(writer_backend.num_layers, count=selfie_num_layers)
         positions = [(L, t) for L in probe_layers for t in out_positions]
 
         df = writer_backend.selfie_on_positions(
@@ -540,7 +614,7 @@ def make_probe_nodes(
         raw_positions = [t for t in range(state["editor_draft_start"], state["editor_draft_end"])
                          if t < hs_len]
         draft_positions = _sample_positions(raw_positions, selfie_max_positions)
-        probe_layers = _probe_layers(editor_backend.num_layers)
+        probe_layers = _probe_layers(editor_backend.num_layers, count=selfie_num_layers)
         positions = [(L, t) for L in probe_layers for t in draft_positions]
 
         df = editor_backend.selfie_on_positions(
@@ -552,12 +626,12 @@ def make_probe_nodes(
         return {**state, "selfie_editor_on_draft": df}
 
     return {
-        "probe_editor":            probe_editor,
-        "probe_editor_selfhs":     probe_editor_selfhs,
-        "probe_editor_writerhs":   probe_editor_writerhs,
-        "probe_writer_selfprobe":  probe_writer_selfprobe,
-        "probe_selfie_writer":     probe_selfie_writer,
-        "probe_selfie_editor":     probe_selfie_editor,
+        "probe_editor":            _timed("probe_editor",           probe_editor),
+        "probe_editor_selfhs":     _timed("probe_editor_selfhs",    probe_editor_selfhs),
+        "probe_editor_writerhs":   _timed("probe_editor_writerhs",  probe_editor_writerhs),
+        "probe_writer_selfprobe":  _timed("probe_writer_selfprobe", probe_writer_selfprobe),
+        "probe_selfie_writer":     _timed("probe_selfie_writer",    probe_selfie_writer),
+        "probe_selfie_editor":     _timed("probe_selfie_editor",    probe_selfie_editor),
     }
 
 
@@ -575,9 +649,13 @@ def add_probe_to_graph(
     selfie_max_new_tokens: int = 15,
     inject_layer: int = 0,
     run_selfie: bool = True,
+    run_self_probe: bool = True,
+    run_arm_b: bool = True,
     selfie_max_positions: int = 8,
+    selfie_num_layers: int = 2,
     writer_selfprobe_system: Optional[str] = None,
     writer_selfprobe_user: Optional[str] = None,
+    verbose_timing: bool = False,
 ) -> StateGraph:
     """
     Attach all probe nodes to `graph` as a linear chain starting from
@@ -609,9 +687,13 @@ def add_probe_to_graph(
         selfie_max_new_tokens=selfie_max_new_tokens,
         inject_layer=inject_layer,
         run_selfie=run_selfie,
+        run_self_probe=run_self_probe,
+        run_arm_b=run_arm_b,
         selfie_max_positions=selfie_max_positions,
+        selfie_num_layers=selfie_num_layers,
         writer_selfprobe_system=writer_selfprobe_system,
         writer_selfprobe_user=writer_selfprobe_user,
+        verbose_timing=verbose_timing,
     )
 
     order = [
@@ -642,9 +724,13 @@ def make_graph(
     selfie_max_new_tokens: int = 15,
     inject_layer: int = 0,
     run_selfie: bool = False,
+    run_self_probe: bool = True,
+    run_arm_b: bool = True,
     selfie_max_positions: int = 8,
+    selfie_num_layers: int = 2,
     writer_selfprobe_system: Optional[str] = None,
     writer_selfprobe_user: Optional[str] = None,
+    verbose_timing: bool = False,
 ):
     """
     Build and compile a complete standalone graph:
@@ -666,8 +752,11 @@ def make_graph(
     """
     g = StateGraph(AgentState)
 
+    import time as _time
+
     # ── writer node ───────────────────────────────────────────────────────────
     def writer_node(state: AgentState) -> AgentState:
+        t0 = _time.time()
         prompt_ids = writer_backend.build_chat_prompt(
             system=_WRITER_SYSTEM,
             user=state["task"],
@@ -677,6 +766,8 @@ def make_graph(
             max_new_tokens=max_writer_tokens,
             capture_hidden=True,
         )
+        if verbose_timing:
+            print(f"  [{'writer':<24s}] {_time.time() - t0:6.2f}s")
         return {
             **state,
             "writer_prompt_ids": prompt_ids,
@@ -698,9 +789,13 @@ def make_graph(
         selfie_max_new_tokens=selfie_max_new_tokens,
         inject_layer=inject_layer,
         run_selfie=run_selfie,
+        run_self_probe=run_self_probe,
+        run_arm_b=run_arm_b,
         selfie_max_positions=selfie_max_positions,
+        selfie_num_layers=selfie_num_layers,
         writer_selfprobe_system=writer_selfprobe_system,
         writer_selfprobe_user=writer_selfprobe_user,
+        verbose_timing=verbose_timing,
     )
 
     return g.compile()

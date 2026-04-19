@@ -570,10 +570,16 @@ class ModelBackend:
                 "Use HiddenStateProjector.between(writer, editor)."
             )
 
+        # Pre-build an index tensor on-device so the patch becomes a single
+        # vectorized scatter — every placeholder position is overwritten in one
+        # tensor op rather than an N-length Python loop.
+        ph_idx = torch.as_tensor(placeholder_positions, device=self.device, dtype=torch.long)
+
         def _patch(hidden: torch.Tensor) -> torch.Tensor:
+            # Only patch during the prompt-length prefill, not decode steps
             if hidden.shape[1] >= prompt_len:
-                for i, pos in enumerate(placeholder_positions):
-                    hidden[:, pos, :] = injected[i]
+                # hidden: (batch, seq_len, H)  →  assign all N injected rows at once
+                hidden[:, ph_idx, :] = injected
             return hidden
 
         handles = []

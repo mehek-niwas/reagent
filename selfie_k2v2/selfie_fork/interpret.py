@@ -115,6 +115,8 @@ def _generate_batch_patched(
     prompt_len = interp_input_ids.shape[1]
     interp_ids = interp_input_ids.to(device)   # (1, prompt_len)
     positions = list(placeholder_positions)
+    pos_idx = torch.as_tensor(positions, device=device, dtype=torch.long)
+    n_ph = pos_idx.shape[0]
 
     results: List[str] = []
 
@@ -125,12 +127,15 @@ def _generate_batch_patched(
 
         batch_ids = interp_ids.expand(bs, -1).contiguous()  # (bs, prompt_len)
 
+        # Pre-expand batch_inj across the placeholder span once per chunk so
+        # the patch becomes a single scatter: (bs, n_ph, H) → hidden[:, pos_idx, :]
+        batch_inj_expanded = batch_inj.unsqueeze(1).expand(bs, n_ph, -1)
+
         def _patch(hidden: torch.Tensor) -> torch.Tensor:
             # hidden: (bs, seq_len, hidden_size)
             # Only patch during the prompt-length prefill pass, not decode steps
             if hidden.shape[1] >= prompt_len:
-                for pos in positions:
-                    hidden[:, pos, :] = batch_inj
+                hidden[:, pos_idx, :] = batch_inj_expanded
             return hidden
 
         handles = []
