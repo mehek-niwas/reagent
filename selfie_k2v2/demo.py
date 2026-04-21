@@ -1,13 +1,7 @@
 """
-SELFIE on K2-V2 writer/editor agents — minimum viable run.
-
-Run from inside the selfie_k2v2/ directory:
+Writer/editor hidden-state probe — minimum viable run.
 
     python demo.py
-
-Before first run:
-
-    pip install 'transformers>=4.45,<4.60' accelerate bitsandbytes langgraph pandas torch
 
 K2-V2-Instruct is 70B. bf16 needs ~140GB VRAM. The script uses
 device_map="auto" so HF will shard across whatever GPUs are visible.
@@ -18,19 +12,12 @@ import os
 import sys
 import time
 
-# Make sure we can import the local modules regardless of where python is run from,
-# as long as this script sits next to them.
-_HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, _HERE)
-
 import torch
-import pandas as pd
 
-from k2v2_backend import K2V2Backend
-from agents_graph import make_graph
+from selfie_k2v2 import K2V2Backend, make_graph
 
+_HERE = os.path.dirname(os.path.abspath(__file__))
 
-# ---- pretty-print helpers ----
 BAR = "=" * 72
 THIN = "-" * 72
 
@@ -49,21 +36,9 @@ def subbanner(title):
     print(THIN)
 
 
-def timed(label):
-    """Context manager-ish decorator used inline via start = time.time()."""
-    pass  # kept for future use
-
-
 def main():
-    pd.set_option("display.max_colwidth", 120)
-    pd.set_option("display.width", 200)
-
-    # ---------------------------------------------------------------------
-    banner("STEP 1 / 6: Load K2-V2-Instruct")
-    # ---------------------------------------------------------------------
-    print("Loading LLM360/K2-V2-Instruct in bf16 with device_map='auto'.")
-    print("First run will download ~140GB of weights to ~/.cache/huggingface/.")
-    print("This can take several minutes even after weights are cached.\n")
+    banner("STEP 1 / 4: Load K2-V2-Instruct")
+    print("Loading LLM360/K2-V2-Instruct in bf16 with device_map='auto'.\n")
 
     t0 = time.time()
     backend = K2V2Backend(
@@ -76,9 +51,7 @@ def main():
     print(f"  num_layers  = {backend.num_layers}")
     print(f"  device      = {backend.device}")
 
-    # --- If you need 4-bit on a smaller GPU, replace the K2V2Backend(...) call
-    # --- above with something like:
-    #
+    # --- 4-bit alternative ----------------------------------------------------
     # from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
     # bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16,
     #                          bnb_4bit_quant_type="nf4")
@@ -86,16 +59,8 @@ def main():
     # backend.tokenizer = AutoTokenizer.from_pretrained("LLM360/K2-V2-Instruct")
     # backend.model = AutoModelForCausalLM.from_pretrained(
     #     "LLM360/K2-V2-Instruct", device_map="auto", quantization_config=bnb)
-    # backend.model.eval()
-    # backend.device = next(backend.model.parameters()).device
-    # backend.hidden_size = backend.model.config.hidden_size
-    # backend.num_layers = len(backend.model.model.layers)
 
-    # ---------------------------------------------------------------------
-    banner("STEP 2 / 6: Sanity check — plain generation")
-    # ---------------------------------------------------------------------
-    print("Running a tiny 'say hi' prompt to confirm the model decodes at all.\n")
-
+    banner("STEP 2 / 4: Sanity check — plain generation")
     t0 = time.time()
     ids = backend.build_chat_prompt(
         system="You are K2, a helpful assistant.",
@@ -107,118 +72,87 @@ def main():
     print(f"Output: {r.output_text!r}")
 
     if not r.output_text.strip():
-        print("\n[!] Empty output from sanity check. Something is wrong with the ")
-        print("    model load or chat template. Stopping before we waste time on ")
-        print("    the full graph.")
+        print("\n[!] Empty output. Check model load or chat template.")
         sys.exit(1)
 
-    # ---------------------------------------------------------------------
-    banner("STEP 3 / 6: Build graph and run writer → editor → 3 experiments")
-    # ---------------------------------------------------------------------
-    print("Graph structure:")
-    print("  writer → editor → selfie_writer (Exp 1)")
-    print("                 → selfie_editor  (Exp 3)")
-    print("                 → injected_editor (Exp 2) → END")
-    print()
-    print("Caps: writer=40 tokens, editor=60 tokens (short on purpose).")
-    print()
-    task = "Describe a golden retriever in 3 sentences."
-    print(f"Task: {task!r}")
-    print()
+    banner("STEP 3 / 4: Build graph and run 4-arm comparison + CG metric")
+    print("Graph: writer → probe_editor (A) → probe_editor_selfhs (B)")
+    print("                                  → probe_editor_writerhs (C)")
+    print("                                  → probe_writer_selfhs  (D)")
+    print("                                  → probe_comm_gap      (CG metric) → END")
+    print("Cost: 5 generate() calls + 2 fast forward passes.\n")
 
-    graph = make_graph(backend, max_writer_tokens=40, max_editor_tokens=60)
+    task = "Describe a golden retriever in 3 sentences."
+    print(f"Task: {task!r}\n")
+
+    graph = make_graph(
+        backend, backend,
+        max_writer_tokens=80, max_editor_tokens=60,
+        inject_layer=0, verbose_timing=True,
+    )
 
     t0 = time.time()
     final = graph.invoke({"task": task})
     print(f"\nFull graph run took {time.time() - t0:.1f}s.")
 
-    # ---------------------------------------------------------------------
-    banner("STEP 4 / 6: Agent outputs (text-level)")
-    # ---------------------------------------------------------------------
-    subbanner("WRITER OUTPUT")
+    banner("STEP 4 / 4: Four-arm comparison")
+    subbanner("WRITER OUTPUT (clean — thinking stripped)")
     print(final["writer_output_text"])
 
-    subbanner("EDITOR VERDICT — normal (sees writer's text)")
+    subbanner("Arm A — EDITOR VERDICT (raw text)")
     print(final["editor_verdict"])
 
-    subbanner("EDITOR VERDICT — injected (writer's hidden states at placeholders)")
-    print(final["editor_injected_verdict"])
+    subbanner("Arm B — EDITOR VERDICT (editor's own hidden states re-injected)")
+    print(final["editor_selfhs_verdict"])
+
+    subbanner("Arm C — EDITOR VERDICT (writer's hidden states injected)")
+    print(final["editor_writerhs_verdict"])
+
+    subbanner("Arm D — WRITER SELF-PROBE (writer's hidden states → writer)")
+    print(final["writer_selfhs_output"])
 
     print()
-    print("Compare the two verdicts above.")
-    print("  - If nearly identical: writer's final hidden states carry roughly the")
-    print("    same info as its surface tokens.")
-    print("  - If very different / injected is garbled: try inject_layer=1 or a")
-    print("    middle layer in agents_graph.injected_editor_node.")
+    print("A ≈ B       →  editor's internal repr and surface text carry the same info.")
+    print("A ≈ C       →  writer's hidden states carry the same info as its text.")
+    print("B ≈ C       →  writer and editor form compatible internal representations.")
+    print("D ≈ answer  →  writer's HS genuinely encode the essay content.")
 
-    # ---------------------------------------------------------------------
-    banner("STEP 5 / 6: Experiment 1 — SELFIE on WRITER hidden states")
-    # ---------------------------------------------------------------------
-    print("Each row interprets the writer's hidden state at one (layer, token).")
-    print("Probe layers were chosen at ~25%, 50%, 75% of the stack.")
-    print()
-    print(final["selfie_writer"].to_string(index=False))
+    cg = final.get("comm_gap")
+    if cg and cg.get("T", 0) > 0:
+        subbanner("Communication Gap (text channel vs. latent channel)")
+        print(f"  response length T : {cg['T']} tokens")
+        print(f"  alpha (cosine)    : {cg['alpha']}")
+        print(f"  beta  (JS)        : {cg['beta']}")
+        print(f"  CG                : {cg['CG']:.4f}")
+        print(f"  mean JS           : {cg['JS_mean']:.4f}")
+        print(f"  mean (1 - cos)    : {cg['COS_mean']:.4f}")
+        print()
+        print("Low CG  →  editor behaves similarly under raw text and latent injection.")
+        print("High CG →  measurable communication gap between writer and editor.")
 
-    # ---------------------------------------------------------------------
-    banner("STEP 6 / 6: Experiment 3 — SELFIE on EDITOR hidden states over draft span")
-    # ---------------------------------------------------------------------
-    print("Each row interprets the editor's hidden state at a position inside")
-    print("the writer's quoted draft (the <DRAFT>...</DRAFT> span).")
-    print()
-    print(final["selfie_editor_on_draft"].to_string(index=False))
-
-    # ---------------------------------------------------------------------
-    banner("SIDE-BY-SIDE: writer_interp vs editor_interp at matched positions")
-    # ---------------------------------------------------------------------
-    print("Aligning both SELFIE tables by (layer, rel_pos) where rel_pos is the")
-    print("offset within the writer's output span.\n")
-
-    wr = final["writer_result"]
-    writer_first = wr.prompt_len
-    draft_first = final["editor_draft_start"]
-
-    w_df = final["selfie_writer"].copy()
-    w_df["rel_pos"] = w_df["token_idx"] - writer_first
-    w_df = w_df.rename(columns={"token": "writer_tok", "interpretation": "writer_interp"})
-
-    e_df = final["selfie_editor_on_draft"].copy()
-    e_df["rel_pos"] = e_df["token_idx"] - draft_first
-    e_df = e_df.rename(columns={"token": "editor_tok", "interpretation": "editor_interp"})
-
-    merged = w_df.merge(
-        e_df[["layer", "rel_pos", "editor_tok", "editor_interp"]],
-        on=["layer", "rel_pos"],
-        how="inner",
-    )
-    merged = merged[
-        ["layer", "rel_pos", "writer_tok", "editor_tok",
-         "writer_interp", "editor_interp"]
-    ].sort_values(["layer", "rel_pos"]).reset_index(drop=True)
-
-    print(merged.to_string(index=False))
-
-    # Optional: write everything out as CSVs for later inspection.
     out_dir = os.path.join(_HERE, "outputs")
     os.makedirs(out_dir, exist_ok=True)
-    final["selfie_writer"].to_csv(os.path.join(out_dir, "selfie_writer.csv"), index=False)
-    final["selfie_editor_on_draft"].to_csv(os.path.join(out_dir, "selfie_editor_on_draft.csv"), index=False)
-    merged.to_csv(os.path.join(out_dir, "merged_side_by_side.csv"), index=False)
 
-    with open(os.path.join(out_dir, "texts.txt"), "w") as f:
-        f.write("=== writer_output_text ===\n")
-        f.write(final["writer_output_text"] + "\n\n")
-        f.write("=== editor_verdict (normal) ===\n")
-        f.write(final["editor_verdict"] + "\n\n")
-        f.write("=== editor_injected_verdict ===\n")
-        f.write(final["editor_injected_verdict"] + "\n")
+    wr = final["writer_result"]
+    with open(os.path.join(out_dir, "arm_verdicts.txt"), "w", encoding="utf-8") as f:
+        f.write(f"task : {task}\n\n")
+        if wr.thinking_text:
+            f.write(f"=== Writer thinking ===\n{wr.thinking_text}\n\n")
+        f.write(f"=== Writer output (clean) ===\n{final['writer_output_text']}\n\n")
+        f.write(f"=== Arm A: editor_verdict (raw text) ===\n{final['editor_verdict']}\n\n")
+        f.write(f"=== Arm B: editor_selfhs_verdict ===\n{final['editor_selfhs_verdict']}\n\n")
+        f.write(f"=== Arm C: editor_writerhs_verdict ===\n{final['editor_writerhs_verdict']}\n\n")
+        f.write(f"=== Arm D: writer_selfhs_output ===\n{final['writer_selfhs_output']}\n\n")
+        if cg and cg.get("T", 0) > 0:
+            f.write(f"=== Communication Gap ===\n")
+            f.write(f"T         : {cg['T']}\n")
+            f.write(f"alpha     : {cg['alpha']}\n")
+            f.write(f"beta      : {cg['beta']}\n")
+            f.write(f"CG        : {cg['CG']:.6f}\n")
+            f.write(f"JS_mean   : {cg['JS_mean']:.6f}\n")
+            f.write(f"COS_mean  : {cg['COS_mean']:.6f}\n")
 
-    print()
-    print(f"CSVs and raw texts written to: {out_dir}/")
-    print("  selfie_writer.csv")
-    print("  selfie_editor_on_draft.csv")
-    print("  merged_side_by_side.csv")
-    print("  texts.txt")
-
+    print(f"\nOutputs written to: {out_dir}/arm_verdicts.txt")
     banner("DONE")
 
 
